@@ -1,0 +1,20 @@
+{
+  "targets": [
+    {
+      "generated": "plugin.claude.json",
+      "destination": ".claude-plugin/plugin.json"
+    },
+    {
+      "generated": "marketplace.claude.json",
+      "destination": ".claude-plugin/marketplace.json"
+    },
+    {
+      "generated": "mcp.json",
+      "destination": ".mcp.json"
+    },
+    {
+      "generated": "plugin.claude-directory.json",
+      "destination": "plugins/claude/.claude-plugin/plugin.json"
+    }
+  ]
+}
