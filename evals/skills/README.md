@@ -1,0 +1,50 @@
+# Skill evals: behavioral specs
+
+**What is tested:** that an agent following a skill produces the right behavior — correct tool sequences, correct artifacts, correct refusals/clarifications — not that the skill's prose reads well.
+
+## Format
+
+One spec per skill in `specs/<slug>.md`. YAML frontmatter + the case body:
+
+```yaml
+---
+spec: eval/skill-spec/<slug>     # spec identity
+skill: skill/<slug>              # the library ID under test (CONTRACT.md §4)
+status: ported | tbd             # tbd = stub, not yet written
+source: tests/specs/<file>.md    # provenance (original prose spec)
+runner: manual                   # manual today; no automated harness yet
+---
+```
+
+Body structure (inherited from the original prose specs, kept because it works):
+
+- **Fixture** — exact starting state: project contents, scene tree, MCP availability.
+- **Cases** — each with `Input` (the literal user message), expected tool
+  sequence / behavior, and checkbox **Assertions**. Every spec should cover at
+  minimum: happy path, one failure/collision path, one ambiguity/edge case,
+  and (where relevant) the no-MCP fallback path.
+- Assertions must be observable facts (a node exists, a question was asked
+  before a write, a tool was NOT called) — never vibes.
+
+## How to run
+
+Today: manually, via `/skill-test <slug> spec` (see `library/skills/skill-test/`),
+or by handing the fixture + input to an agent and checking assertions by hand.
+`skill-improve` uses these specs as its with/without harness.
+
+Automated execution (LLM-driven, against a live engine fixture) is planned,
+not built. The specs are written so a future runner needs no reformatting:
+fixtures are machine-buildable, inputs are literal strings, assertions are
+checkable predicates.
+
+## CI
+
+No CI gate yet: nothing runs deterministically without an LLM and an engine.
+Reviewers check that each spec's `skill:` ID exists in the library. When the
+automated runner lands, `status: ported` specs become required gates for
+changes to their skill.
+
+## Coverage
+
+- 12 ported specs in `specs/`, from the prose specs in `tests/specs/`.
+- 6 TBD stubs and the skills with no spec at all are tracked in [issue #77](https://github.com/summerengine/summer/issues/77).
