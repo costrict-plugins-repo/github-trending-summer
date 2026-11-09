@@ -1,0 +1,23 @@
+{
+  "$id": "skill.schema.json",
+  "title": "Summer resource.yaml — kind: skill (requires sibling SKILL.md, checked by validate-library)",
+  "type": "object",
+  "allOf": [{ "$ref": "resource.schema.json" }],
+  "properties": {
+    "kind": { "const": "skill" },
+    "hosted_resource": {
+      "type": "string",
+      "pattern": "^summer://skills/[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "The skill's current text lives on the hosted Summer Engine MCP as this resource; summer_read_library loads it from there (store sign-in) and falls back to the local SKILL.md."
+    },
+    "recommended": {
+      "type": "boolean",
+      "description": "Installed by `summer skills install --recommended` (and `summer setup`). Omitted means false."
+    },
+    "bundled": {
+      "type": "boolean",
+      "description": "Installed by bulk installs (`summer setup`, `summer skills install --all/--recommended/--assets`) and listed in the plugin manifests. Omitted means true. false keeps the skill in the library (search, summer_read_library, install by name) without putting its description in every session: for library-author tools and research digests."
+    }
+  },
+  "unevaluatedProperties": false
+}

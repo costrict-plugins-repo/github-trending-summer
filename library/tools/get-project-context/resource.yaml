@@ -1,0 +1,56 @@
+id: tool/get-project-context
+kind: tool
+version: 2.0.0
+summary: "Bind to the open project and return a compact context (project, current and main scene, health summary, template pin, memory, warnings); tree on request."
+use_when:
+  - first call in every fresh session, to avoid guessing scene filenames
+  - deliberately rebinding after the engine switched projects
+  - reading the open scene's tree, the engine's op list or project settings (include)
+facets:
+  lifecycle:
+    - build
+  domains:
+    - project
+    - engine
+compatibility:
+  engine: ">=4.6"
+source: official
+license: MIT
+status: stable
+aliases:
+  - summer_get_project_context
+implementation:
+  module: src/mcp/tools/project-tools.ts
+  export: registerProjectTools
+surfaces:
+  mcp:
+    tool_name: summer_get_project_context
+    remote: false
+input_schema:
+  type: object
+  properties:
+    include:
+      type: array
+      items:
+        type: string
+        enum:
+          - scene_tree
+          - capabilities
+          - settings
+      maxItems: 3
+      description: "Heavy blocks to add to the compact default: 'scene_tree' (the open scene's node tree, up to 200 nodes), 'capabilities' (the engine's full op/capability lists), 'settings' (project settings, curated groups). settingsPrefix/settingsPrefixes imply 'settings'."
+    settingsPrefix:
+      type: string
+      description: Only return project settings whose key starts with this prefix, e.g. 'audio/' or 'application/config/'. Omit for the curated default set.
+    settingsPrefixes:
+      type: array
+      items:
+        type: string
+      description: Several settings groups at once, e.g. ['audio/', 'layer_names/2d_physics/', 'input/ui_']. Merged with settingsPrefix. Omit for the curated default set.
+  additionalProperties: false
+authority:
+  filesystem: false
+  editor_mutation: false
+  network: false
+  credentials: false
+  publish: false
