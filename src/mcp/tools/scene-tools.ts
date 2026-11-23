@@ -1,0 +1,470 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { viewSetOp } from "../../core/capabilities/view-set.js";
+import { z } from "zod";
+import { withEngine, ToolInputError } from "./with-engine.js";
+import { executeSceneMutation } from "../../core/capabilities/engine-ops.js";
+import { instantiateScene, runBatch } from "../../core/capabilities/placement-batch.js";
+import { renderPlacementResult } from "./placement-tools.js";
+import { inspectNodeFields, inspectNodeInputShape } from "../../core/capabilities/inspect-node.js";
+import { inspectResource, inspectResourceInputShape } from "../../core/capabilities/inspect-resource.js";
+import {
+  rawSceneReplaceRefusal,
+  replaceNodeInputShape,
+  replaceNodePersisted,
+} from "../../core/capabilities/replace-node.js";
+import { connectSignalInputShape, connectSignalPersisted } from "../../core/capabilities/connect-signal.js";
+import {
+  FALLBACK_SINGLE_ONLY_OPS,
+  resolveSingleOnlyOps,
+} from "../../core/capability-skew.js";
+
+// Re-exported for tests and for callers that reason about dispatch classes.
+// executeSceneMutation is the ONE copy in core/capabilities/engine-ops.ts,
+// re-exported here for the spatial tools (snap / align).
+export { FALLBACK_SINGLE_ONLY_OPS, resolveSingleOnlyOps, executeSceneMutation };
+
+function requireSuccessfulOps(result: unknown, context: string): Record<string, unknown> {
+  const receipt = (result ?? {}) as Record<string, unknown>;
+  const results = Array.isArray(receipt.results)
+    ? receipt.results as Array<Record<string, unknown>>
+    : [];
+  const failed = results.find((entry) => entry?.ok === false);
+  if (receipt.status === "error" || failed) {
+    const error =
+      (typeof failed?.error === "string" && failed.error) ||
+      (typeof receipt.error === "string" && receipt.error) ||
+      `${context} failed`;
+    throw new Error(error);
+  }
+  return receipt;
+}
+
+/** Compose the minimal valid .tscn text scene: header + one root node.
+ *  `uid` and `load_steps` are optional in the engine parser
+ *  (resource_format_text.cpp treats a missing uid as INVALID_ID); the editor
+ *  assigns a uid on first save. */
+function minimalSceneText(rootName: string, rootType: string): string {
+  return `[gd_scene format=3]\n\n[node name="${rootName}" type="${rootType}"]\n`;
+}
+
+const finiteNumber = z.number().finite();
+const finiteVector3 = z.tuple([finiteNumber, finiteNumber, finiteNumber]);
+
+// Node names reject . : @ / " %; the type must be a plain class name.
+// Both are interpolated into quoted .tscn fields, so validate before composing.
+const VALID_ROOT_NAME = /^[A-Za-z_][A-Za-z0-9_\- ]*$/;
+const VALID_ROOT_TYPE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export function registerSceneTools(server: McpServer): void {
+  server.tool(
+    "summer_create_scene",
+    `Create a new empty scene file. Writes a minimal .tscn through the identity-bound engine with a create-only guard: it fails if the path already exists, and it never touches the currently open scene.
+
+The new scene is on disk but NOT opened. Call summer_open_scene to start editing it, then summer_add_node to build it out.
+
+Recommended workflow:
+1) Call summer_get_project_context
+2) Call summer_create_scene with a new res:// path
+3) Call summer_open_scene with that path`,
+    {
+      path: z.string().describe("New scene path, e.g. 'res://scenes/empty_level.tscn'"),
+      rootName: z.string().default("Main").describe("Root node name for the new scene"),
+      rootType: z
+        .string()
+        .default("Node3D")
+        .describe(
+          "Root node type. Default 'Node3D' (3D scenes); common alternatives: 'Node2D' (2D scenes), 'Control' (UI scenes), 'Node' (logic-only)."
+        ),
+      allow_temporary_scene_mutation: z
+        .boolean()
+        .optional()
+        .describe(
+          "DEPRECATED, ignored. Scene creation no longer mutates any open scene; kept only so older callers don't break."
+        ),
+    },
+    async ({ path, rootName, rootType }) =>
+      withEngine(async (client) => {
+        const safePath = path.trim().replace(/\\/g, "/");
+        if (!safePath.startsWith("res://") || safePath.includes("..")) {
+          throw new ToolInputError("Scene path must be a traversal-free res:// project path.");
+        }
+        if (!safePath.endsWith(".tscn")) {
+          throw new ToolInputError("New scenes must use the text format: the path must end in .tscn.");
+        }
+        if (!VALID_ROOT_NAME.test(rootName)) {
+          throw new ToolInputError(
+            `Invalid rootName "${rootName}": use letters, digits, underscores, hyphens, or spaces, starting with a letter or underscore.`
+          );
+        }
+        if (!VALID_ROOT_TYPE.test(rootType)) {
+          throw new ToolInputError(
+            `Invalid rootType "${rootType}": must be a plain class name like 'Node3D', 'Node2D', or 'Control'.`
+          );
+        }
+
+        // Same engine-routed guarded write path summer_write_file uses:
+        // identity-bound, and mustNotExist makes the engine refuse (create-only)
+        // if the path already exists. The open scene is never touched.
+        const receipt = requireSuccessfulOps(
+          await client.executeIdentityBoundOps([
+            {
+              op: "WriteFile",
+              path: safePath,
+              content: minimalSceneText(rootName, rootType),
+              mustNotExist: true,
+            },
+          ]),
+          `Creating ${safePath}`,
+        );
+
+        // Post-write verification: read the file back through the engine. The
+        // write receipt already passed; a read-back failure is reported honestly
+        // instead of failing the create or being masked.
+        let verified = false;
+        let verifyError: string | undefined;
+        try {
+          const read = (await client.readProjectFile(safePath, 4096)) as {
+            ok?: boolean;
+            error?: unknown;
+            data?: { content?: unknown };
+          };
+          const content = typeof read?.data?.content === "string" ? read.data.content : null;
+          if (read?.ok === false) {
+            verifyError = String(read.error ?? "engine could not read the file back");
+          } else if (content === null) {
+            verifyError = "engine returned no text content on read-back";
+          } else if (!content.includes(`[node name="${rootName}"`)) {
+            verifyError = "read-back content does not contain the expected root node";
+          } else {
+            verified = true;
+          }
+        } catch (err) {
+          verifyError = err instanceof Error ? err.message : String(err);
+        }
+
+        return {
+          ok: true,
+          created: safePath,
+          rootName,
+          rootType,
+          verified,
+          ...(verifyError ? { verifyError } : {}),
+          receipt,
+          hint: "The new scene is on disk but not open. Call summer_open_scene to start editing it.",
+        };
+      })
+  );
+
+  server.tool(
+    "summer_add_node",
+    `Add a new node to the scene tree.
+
+Pass the exact res:// scenePath to mutate. The scene does not need to be the
+active editor tab.
+
+Common node types:
+- 3D: Node3D, MeshInstance3D, CharacterBody3D, RigidBody3D, StaticBody3D, Camera3D, DirectionalLight3D, OmniLight3D, SpotLight3D, WorldEnvironment, CollisionShape3D, Area3D
+- 2D: Node2D, Sprite2D, CharacterBody2D, RigidBody2D, StaticBody2D, Camera2D, CollisionShape2D, Area2D, TileMapLayer
+- UI: Control, Label, Button, TextEdit, Panel, VBoxContainer, HBoxContainer, MarginContainer
+- Audio: AudioStreamPlayer, AudioStreamPlayer3D
+
+The parent path uses "./" prefix for relative paths from scene root. E.g., "./World" means the "World" child of the root node.`,
+    {
+      scenePath: z.string().describe("Target scene path, e.g. 'res://main.tscn'"),
+      parent: z.string().describe("Parent node path, e.g. './World' or './World/Enemies'"),
+      type: z.string().describe("Summer Engine node type, e.g. 'MeshInstance3D', 'CharacterBody3D'"),
+      name: z.string().describe("Name for the new node, e.g. 'Player', 'MainCamera'"),
+    },
+    async ({ scenePath, parent, type, name }) =>
+      withEngine(async (client) =>
+        executeSceneMutation(client, scenePath, [{ op: "AddNode", parent, type, name }])
+      )
+  );
+
+  server.tool(
+    "summer_set_prop",
+    `Set a property on a node. This is the primary way to configure nodes after adding them.
+
+VALUE FORMAT — Godot string syntax for complex types:
+- Vector3: "Vector3(0, 10, 0)" — position, scale, rotation_degrees
+- Vector2: "Vector2(100, 200)" — 2D position, size
+- Color: "Color(1, 0.5, 0, 1)" — RGBA, always 4 components, values 0.0-1.0
+- Transform3D: "Transform3D(1,0,0, 0,1,0, 0,0,1, 0,5,0)" — basis + origin
+- Resource class name: "BoxMesh", "SphereMesh", "StandardMaterial3D" — auto-instantiated
+- Numbers: 1.5, 42 — native JSON
+- Booleans: true, false — native JSON
+- Strings: "hello" — native JSON
+
+COMMON PROPERTIES:
+- position: "Vector3(x, y, z)" — world position
+- rotation_degrees: "Vector3(rx, ry, rz)" — rotation in degrees
+- scale: "Vector3(sx, sy, sz)" — scale factor
+- visible: true/false — visibility
+- mesh: "BoxMesh", "SphereMesh", "CapsuleMesh", "CylinderMesh", "PlaneMesh"
+- shadow_enabled: true — for lights
+- light_energy: 1.5 — light intensity
+- fov: 75.0 — camera field of view`,
+    {
+      scenePath: z.string().describe("Target scene path, e.g. 'res://main.tscn'"),
+      path: z.string().describe("Node path, e.g. './World/Player'"),
+      key: z.string().describe("Property name, e.g. 'position', 'mesh', 'visible'"),
+      value: z.union([z.string(), z.number(), z.boolean()]).describe(
+        "Value in Summer Engine variant-string format for complex types, native JSON for primitives"
+      ),
+    },
+    async ({ scenePath, path, key, value }) =>
+      withEngine(async (client) =>
+        executeSceneMutation(client, scenePath, [{ op: "SetProp", path, key, value }])
+      )
+  );
+
+  server.tool(
+    "summer_set_resource_property",
+    `Set a nested property on a resource attached to a node.
+
+Use when you need to modify a sub-property of a resource, like:
+- CollisionShape3D shape size: nodePath="./Player/CollisionShape3D", resourceProperty="shape", subProperty="size", value="Vector3(1, 2, 1)"
+- Material albedo color: nodePath="./Floor", resourceProperty="material_override", subProperty="albedo_color", value="Color(0.2, 0.5, 0.2, 1)"
+- Mesh size: nodePath="./Box", resourceProperty="mesh", subProperty="size", value="Vector3(2, 2, 2)"`,
+    {
+      scenePath: z.string().describe("Target scene path, e.g. 'res://main.tscn'"),
+      nodePath: z.string().describe("Node path, e.g. './Player/CollisionShape3D'"),
+      resourceProperty: z.string().describe("Resource property on the node, e.g. 'shape', 'mesh', 'material_override'"),
+      subProperty: z.string().describe("Property on the resource, e.g. 'size', 'radius', 'albedo_color'"),
+      value: z.union([z.string(), z.number(), z.boolean()]).describe("Value in Summer Engine variant-string format"),
+    },
+    async ({ scenePath, nodePath, resourceProperty, subProperty, value }) =>
+      withEngine(async (client) =>
+        executeSceneMutation(client, scenePath, [
+          { op: "SetResourceProperty", nodePath, resourceProperty, subProperty, value },
+        ])
+      )
+  );
+
+  server.tool(
+    "summer_remove_node",
+    "Remove a node from the scene tree. All children are removed too. Cannot remove the root node. Supports undo. Destructive operation: do not delete multiple top-level nodes unless the user explicitly requests destructive changes.",
+    {
+      scenePath: z.string().describe("Target scene path, e.g. 'res://main.tscn'"),
+      path: z.string().describe("Node path to remove, e.g. './World/OldEnemy'"),
+    },
+    async ({ scenePath, path }) =>
+      withEngine(async (client) => executeSceneMutation(client, scenePath, [{ op: "RemoveNode", path }]))
+  );
+
+  server.tool(
+    "summer_save_scene",
+    "Save an explicit scene to disk. Mutation tools already append one save; use this for a standalone save or save-as.",
+    {
+      scenePath: z.string().describe("Scene to save, e.g. 'res://main.tscn'"),
+      path: z.string().optional().describe("Optional save-as path, e.g. 'res://levels/level2.tscn'"),
+    },
+    async ({ scenePath, path }) =>
+      withEngine(async (client) => {
+        const op: Record<string, unknown> = { op: "SaveScene" };
+        if (path) op.path = path;
+        return executeSceneMutation(client, scenePath, [op]);
+      })
+  );
+
+  server.tool(
+    "summer_open_scene",
+    `Open a scene file in the editor. Use this to switch between scenes.
+
+Do not guess paths. Prefer:
+1) summer_get_project_context (read mainScene)
+2) summer_open_main_scene (open known main scene)
+3) summer_open_scene only when user gave an explicit path.`,
+    { path: z.string().describe("Scene path, e.g. 'res://main.tscn' or 'res://levels/level1.tscn'") },
+    async ({ path }) =>
+      withEngine(async (client) =>
+        client.executeOps([{ op: "OpenScene", path }])
+      )
+  );
+
+  server.tool(
+    "summer_instantiate_scene",
+    `Add an existing scene or 3D model as a child node. Use this to:
+- Add a .tscn prefab (reusable scene) as a child
+- Add a .glb/.gltf 3D model into the scene
+- Compose scenes from smaller scenes (e.g., add a "Player" scene into a "Level" scene)
+
+The scene must already exist in the project. Use summer_import_from_url first if importing from external sources.
+
+PASS target_size FOR IMPORTED MODELS. Downloaded/generated .glb assets arrive at arbitrary scale (a "chair" can be 40 units tall). target_size uniformly scales the instanced subtree so its largest world-AABB dimension equals that many units — commit to real-world size: chair 1.0, door 2.0, car 4.5, person 1.7, tree 6-10. The result then reports dimensions + scale_applied; verify placement afterwards (summer_world_snapshot AABBs, summer_screenshot). Older engine builds ignore target_size — when the result lacks scale_applied, this tool appends a note and you must scale the node yourself (summer_set_prop scale) and re-check.
+
+PLACE IT IN THE SAME CALL: position, rotation_degrees and scale ([x, y, z], parent-local, like summer_set_prop), or transform (a "Transform3D(...)" string). The instance is created, then those properties are set on the exact node path the receipt reports (a name collision rename is followed), then the scene is saved: one call per piece, no window at the origin. The result adds placement {nodePath, applied, fields}. Do not combine transform with the others, or scale/transform with target_size. Measure a kit piece first with summer_inspect_asset.`,
+    {
+      scenePath: z.string().describe("Target scene to receive the instance, e.g. 'res://main.tscn'"),
+      parent: z.string().describe("Parent node path, e.g. './World'"),
+      scene: z.string().describe("Scene/model path, e.g. 'res://player.tscn' or 'res://models/tree.glb'"),
+      name: z.string().optional().describe("Override the instance name"),
+      target_size: z
+        .number()
+        .positive()
+        .optional()
+        .describe(
+          "Normalize the instance's physical size: uniformly scale it so its largest world-AABB dimension equals this many units (chair 1.0, car 4.5, person 1.7). Strongly recommended for imported .glb/.gltf models."
+        ),
+      position: finiteVector3.optional().describe("Parent-local position [x, y, z] set right after the instance is created."),
+      rotation_degrees: finiteVector3.optional().describe("Parent-local rotation in degrees [x, y, z] (Godot rotation_degrees)."),
+      scale: finiteVector3.optional().describe("Local scale [x, y, z]. Not with target_size."),
+      transform: z
+        .string()
+        .optional()
+        .describe('Full local transform as "Transform3D(xx, xy, xz, yx, yy, yz, zx, zy, zz, ox, oy, oz)" (Godot row-major basis, then origin). Not with position/rotation_degrees/scale/target_size.'),
+    },
+    async (args) =>
+      // E2E: an older engine applies the op but silently drops target_size —
+      // instantiateScene appends target_size_note when scale_applied is absent.
+      withEngine(async (client) => instantiateScene(client, args))
+  );
+
+  server.tool(
+    "summer_connect_signal",
+    `Connect a signal between two nodes so the connection is SAVED in the scene. Signals are Godot's event system — they notify when something happens.
+
+Common signals:
+- "body_entered" / "body_exited" — Area3D/Area2D detects physics bodies
+- "pressed" — Button clicked
+- "timeout" — Timer finished
+- "area_entered" — Area detects another area
+- "input_event" — CollisionObject received input
+
+The receiver should have the method (a script method, or a built-in such as queue_free); a missing one is saved anyway and reported in warnings. scenePath must be a .tscn.
+
+PERSISTENCE IS VERIFIED: the engine's ConnectSignal op connects without CONNECT_PERSIST, so its connection never reached the file. This tool connects through a RunSceneScript probe with CONNECT_PERSIST (replacing a non-persistent connection of the same pair), saves, reads the saved .tscn back and returns persisted:true / verified:true only when the [connection] line is there; otherwise an error with failure_reason not_persisted. The probe runs in the active tab: a scene in a background tab is brought forward and the user's tab restored (tab_switched). One Ctrl+Z reverts it.`,
+    connectSignalInputShape,
+    async (args) => withEngine(async (client) => connectSignalPersisted(client, args))
+  );
+
+  server.tool(
+    "summer_select_node",
+    "Select a node in the editor's scene tree and show it in the inspector panel. Useful for focusing the editor on a specific node.",
+    {
+      nodePath: z.string().describe("Node path to select"),
+      scenePath: z.string().optional().describe("Open this scene first, then select the node"),
+    },
+    async ({ nodePath, scenePath }) =>
+      withEngine(async (client) => {
+        const op: Record<string, unknown> = { op: "SelectNode", nodePath };
+        if (scenePath) op.scenePath = scenePath;
+        return client.executeOps([op]);
+      })
+  );
+
+  server.tool(
+    "summer_view_set",
+    "Show the person what you are working on: the editor's view (home, chat, 3d, 2d, script, game, studio), its right rail (files, scene, inspector, output, none), what to focus (a res:// script or scene, or a node path) and the nodes to frame the camera on. Changes only what is on screen. The navigate-summer skill says which view fits which moment.",
+    {
+      view: z.enum(["home", "chat", "3d", "2d", "script", "game", "studio"]).describe("The view to show"),
+      rail: z.enum(["files", "scene", "inspector", "output", "none"]).optional().describe("The right rail; none hides it"),
+      focus: z.string().optional().describe("A res:// script or scene, or a node path"),
+      frame: z.array(z.string()).optional().describe("Node paths to frame the camera on"),
+    },
+    async ({ view, rail, focus, frame }) =>
+      withEngine(async (client) => client.executeOps([viewSetOp({ view, rail, focus, frame })]))
+  );
+
+  server.tool(
+    "summer_replace_node",
+    `Replace a node with a different scene/model or node type, keeping its parent, sibling index, name, transform and property overrides, and the children the scene added under it. Use it to swap a kit piece for another (a wall host for a door host), a placeholder for a prefab, or a StaticBody3D for a RigidBody3D.
+
+Give exactly one of scene or type. The scenePath must be a .tscn.
+
+PERSISTENCE IS VERIFIED: the tool saves, reads the saved .tscn back and checks that the node at path now instances the new scene (or has the new type), under the same parent, with every child present. persisted:true is proven from the file; a mismatch is an error with failure_reason not_persisted — never report that as done.
+
+How: a scene swap runs as InstantiateScene (temporary name) -> SetProp each property override -> ReparentNode the children -> MoveNode to the old index -> RemoveNode the old node -> rename -> SaveScene, because the engine's own ReplaceNode keeps the OLD scene reference in the saved file. A type change of a plain node uses the engine's ReplaceNode. State that cannot travel (groups, signal connections, scene-local sub_resource values, overrides of nodes inside the old scene) is listed in not_carried_over. Undo takes one Ctrl+Z per step.`,
+    replaceNodeInputShape,
+    async (args) => withEngine(async (client) => replaceNodePersisted(client, args))
+  );
+
+  server.tool(
+    "summer_inspect_node",
+    `Get all editable properties of a node with their current values, types, and resource info.
+
+Call this before modifying a node to understand its current state. Returns every property the Godot inspector would show. Each prop carries the engine's raw Variant.Type integer as "type" plus its name as "type_name" (e.g. type 5 = TYPE_VECTOR2, 20 = TYPE_COLOR, 24 = TYPE_OBJECT); resource-valued props also carry resource_type / resource_path.
+
+Reads the currently OPEN scene — "path" is relative to its root (there is no scenePath argument; open the scene first if needed).
+
+Example: inspect a light to see its energy, color, shadow settings before changing them.
+
+The full read is about 5 KB. To read only what you need, pass fields: property names or globs ('position', 'surface_material_override/*'), plus derived fields: transform (local position / rotation_degrees / scale, and a Transform3D literal for 3D nodes), global_transform (world origin + Transform3D, composed from the world snapshot), scene_file_path (the scene this node instances), aabb (world bounds), warnings. Example: fields:['transform','global_transform','scene_file_path'] is a few hundred bytes. missing_fields and unavailable say what could not be read.`,
+    inspectNodeInputShape,
+    async (args) =>
+      // E2E 2026-09-03 F-14: the engine returns Variant.Type as a bare int.
+      withEngine(async (client) => inspectNodeFields(client, args))
+  );
+
+  server.tool(
+    "summer_inspect_resource",
+    `Read a resource: a material, mesh, shape, texture, environment, or a scene/model file.
+
+Two forms, pass exactly one:
+- path: a resource FILE ('res://materials/ground.tres', a mesh 'res://kit/meshes/wall_01.res', 'res://models/player.glb'), loaded read-only in the editor. A Mesh returns its AABB, surface_count and per surface the primitive, vertex and index counts, attributes, triangles and material (class, path or embedded, albedo for standard materials), plus the unique materials and blend shapes. A scene or model (.tscn/.glb/.gltf) returns its node count, the first 40 nodes with type, instanced scene and mesh, and its meshes; summer_inspect_asset measures it (AABB, planes, ports). Every other resource (and a mesh) returns its editor properties that differ from the class default (props), with props_at_default counting the rest.
+- nodePath + property: a resource a node of the ACTIVE scene tab holds, e.g. nodePath 'Floor', property 'mesh'. For example, summer_inspect_node tells you a MeshInstance3D has a "StandardMaterial3D" material_override — this form returns its albedo_color, metallic, roughness, etc.`,
+    inspectResourceInputShape,
+    async (args) => withEngine(async (client) => inspectResource(client, args))
+  );
+
+  server.tool(
+    "summer_batch",
+    `Execute multiple operations (a multi-node build) in a single call. Each op is forwarded to the engine VERBATIM: this is also how you reach engine ops without a dedicated tool.
+
+UNDO: when nothing in the list forces a split (see SPLITS), the whole batch is ONE undo step (one Ctrl+Z). Single-only ops split the list into sequential requests, and EACH chunk is its own undo step (the receipt shows the chunks).
+
+Ops use the individual tools' format:
+- {"op": "AddNode", "parent": "/", "type": "MeshInstance3D", "name": "Floor"}
+- {"op": "SetProp", "path": "Floor", "key": "position", "value": "Vector3(0, -1, 0)"}
+- {"op": "SetProp", "path": "Floor", "key": "mesh", "value": "PlaneMesh"}
+- {"op": "SetResourceProperty", "nodePath": "Floor", "resourceProperty": "mesh", "subProperty": "size", "value": "Vector2(20, 20)"}
+
+SPLITS AND SAVE: scenePath selects every mutation target. Send OpenScene (a UI action) separately, never mixed with scene mutations. The tool appends one final SaveScene when the batch mutates a scene; a SaveScene you supply must appear exactly once, as the final op. The engine requires SaveScene, InstantiateScene, ReplaceNode, SimulateInput, the runtime reads (GetRuntimeSceneTree/GetRuntimeNode) and the Run*/Import* ops to travel alone, so the tool splits the list around them; if a later chunk fails, the receipt names the earlier ops that already applied.
+
+RAW RUNTIME OPS (structured failure_reason passes through verbatim):
+- RunVerification: a hidden, disposable game instance runs a GDScript probe and dies, never touching the editor: {"op": "RunVerification", "probe_source": "...", "max_seconds": 20} returns {ok, results, frames, out_dir}. Probe API: report(name, value) / save_frame(name) / press(action) / key(keycode) / finish(); save_frame() without a name is a script error. Mount scenes deferred (add_child.call_deferred) or the capture can be black; summer_get_agent_playbook has the probe rules.
+- SimulateInput: inject an action/key/mouse/axis into the RUNNING game (summer_play first), sent ALONE: {"op": "SimulateInput", "type": "action", "action": "jump", "pressed": true}. failure_reason "not_running" = start the game first; "unsupported" = the game build predates the handler: use RunVerification or ask the user.
+
+REFUSED: a raw ReplaceNode with scene (it saves the old scene reference; use summer_replace_node) and a raw ConnectSignal (no CONNECT_PERSIST, so the file never holds it; use summer_connect_signal).
+
+REPARENTNODE KEEPS ITS SUBTREE AND IS VERIFIED: the engine op re-owns only the moved node and drops its descendants from the saved file, so the tool saves, sends each ReparentNode alone plus an in-place ReparentNode per scene-owned descendant, then reads the saved .tscn back: persisted:true / verified:true only when every moved node and descendant is at its new path, else failure_reason not_persisted. A move onto a parent with a same-named child is refused (name_collision). scenePath must be a .tscn; Undo cannot share the batch.
+
+PLACED INSTANCES: an InstantiateScene op may carry position, rotation_degrees, scale ([x, y, z] or "Vector3(...)") or transform ("Transform3D(...)"), set on the created node; one op per piece. Each InstantiateScene is its own request and the transforms of a run follow together (up to 200 per request), so N pieces plus the save cost about N + 2 requests and undo steps. Later ops (SetProp, SnapToSurface, the save) see the pieces placed; if one fails, the pieces before it still get their transforms.
+
+RECEIPTS: receipt "summary" returns only counts, failures [{index, op, error}] (index into your ops), created node paths and renames, under 5 KB with any cut declared. Use it for any batch over a few ops: a large full receipt overflows the tool-output limit.
+
+scenePersistence.saved means the SaveScene ran, not what the file holds; verified:true is set only where the tool read the file back.`,
+    {
+      scenePath: z.string().optional().describe(
+        "Required when ops contains scene mutations; exact res:// target scene path",
+      ),
+      ops: z.array(z.record(z.unknown())).describe("Array of operation objects, each with 'op' plus its parameters"),
+      receipt: z
+        .enum(["full", "summary"])
+        .optional()
+        .describe("full (default): every engine receipt. summary: counts, failures with op index, created node paths only (under 5 KB)."),
+    },
+    async ({ scenePath, ops, receipt }) =>
+      withEngine(async (client) => {
+        const rawFileMutation = ops.find((op) => {
+          const kind = String(op.op ?? "");
+          return kind === "WriteFile" || kind === "ReplaceText";
+        });
+        if (rawFileMutation) {
+          throw new ToolInputError(
+            `summer_batch does not accept raw ${String(rawFileMutation.op)} operations. ` +
+            "Use summer_write_file or summer_replace_text so project identity, content guards, and same-file ordering are enforced."
+          );
+        }
+        const replaceRefusal = rawSceneReplaceRefusal(ops);
+        if (replaceRefusal) throw new ToolInputError(replaceRefusal);
+        // Scene mutations get one final SaveScene; read-only spatial queries
+        // (TestPlacement3D, NavigationProbe3D, Starcast3D) are identity-bound
+        // to the scene but never saved (core/capabilities/placement-batch.ts).
+        const result = await runBatch(client, { scenePath, ops: ops as Record<string, unknown>[], receipt });
+        return receipt === "summary" ? { summaryReceipt: result as Record<string, unknown> } : result;
+      }, receipt === "summary"
+        ? { onResult: (wrapped) => renderPlacementResult((wrapped as { summaryReceipt: Record<string, unknown> }).summaryReceipt) }
+        : undefined)
+  );
+}

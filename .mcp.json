@@ -1,0 +1,13 @@
+{
+  "_generated": "GENERATED from integrations/claude — do not edit; npm run generate:registry",
+  "mcpServers": {
+    "summer-engine": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "summer-engine@latest",
+        "mcp"
+      ]
+    }
+  }
+}
